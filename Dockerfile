@@ -13,21 +13,46 @@
 FROM python:3.12-slim-bookworm
 ARG TARGETARCH
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
-# Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
-# setup_20.x 是 NodeSource 的**可变脚本**（内容会随上游更新而变），直接管道执行
-# 等于每次构建都盲信上游。这里先落盘、比对钉死的 SHA256 再执行，fail-closed：
-# 哈希不符说明上游改了脚本，先审计 diff 再决定是否更新哈希，不要盲目刷新。
-# 哈希取值日期 2026-09-13。回退方案：改用 nodejs 官方 tarball（nodejs.org，固定
-# 版本 + 官方 SHA256SUMS 签名文件），彻底绕开第三方仓库脚本。
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Node 来源：nodejs 官方 tarball（自带 npm），**不再**走 NodeSource 的 apt 脚本。
+# 原因（2026-10-13 实测）：setup_20.x 脚本内部先要 apt-get install gnupg，该步一旦被
+# 镜像源 502 打断，脚本自己仍以 exit 0 收尾，&& 链继续往下走，apt 就静默回退到
+# Debian bookworm 自带的 nodejs 18——而那个包**不含 npm**，下一层 `npm` 直接 exit 127，
+# 报错还只显示 "npm: not found"，极难定位。官方 tarball 版本固定、自带 npm、
+# 不依赖任何第三方 apt 源，把这个失败模式彻底消掉（bookworm 自带 nodejs 是 18，
+# 而 Playwright 要求 >=20，故也不能直接用 apt 的 nodejs）。
+# 注：曾用「落盘 + 比对 SHA256 再执行 setup_20.x」的 fail-closed 方案，但哈希只能
+# 保证脚本没被篡改，挡不住它内部 apt-get 失败后仍 exit 0 这一类问题，故弃用。
+# NODE_MIRROR 可覆盖为国内加速地址；主源失败会自动回退 registry.npmmirror.com。
+ARG NODE_VERSION=20.20.0
+ARG NODE_MIRROR=https://nodejs.org/dist
+# 可选构建参数:APT 镜像站(默认官方 deb.debian.org;国内可传 mirrors.aliyun.com 或 mirrors.ustc.edu.cn)
+ARG APT_MIRROR=
+ARG NPM_REGISTRY=https://registry.npmjs.org
+RUN if [ -n "$APT_MIRROR" ]; then \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x -o /tmp/nodesource_setup.sh \
-    && echo "2c4c6683a17b6f4128898a7b521e3c8bb725a99ffaf1b5e32ac97c6fa7d381be  /tmp/nodesource_setup.sh" | sha256sum -c - \
-    && bash /tmp/nodesource_setup.sh \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -f /tmp/nodesource_setup.sh \
     && rm -rf /var/lib/apt/lists/*
+# 装 Node + npm（官方二进制；装完显式打印版本，npm 缺失时立即 fail-closed）
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) narch=x64 ;; \
+      arm64) narch=arm64 ;; \
+      *) echo "unsupported arch: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    ok=0; \
+    for base in "$NODE_MIRROR" "https://registry.npmmirror.com/-/binary/node"; do \
+      url="$base/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${narch}.tar.gz"; \
+      if curl -fsSL --retry 3 --retry-connrefused --connect-timeout 15 "$url" -o /tmp/node.tar.gz; then ok=1; break; fi; \
+      echo "warn: 下载失败，尝试下一个镜像源: $url" >&2; \
+    done; \
+    [ "$ok" = 1 ] || { echo "error: 无法下载 node v${NODE_VERSION}" >&2; exit 1; }; \
+    tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1; \
+    rm -f /tmp/node.tar.gz; \
+    node -v; npm -v
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
 # 版本钉死（2026-09-13 自 npm registry 的 latest 取值）：@latest 会让同一 Dockerfile
 # 在不同时间构建出不同镜像，升级时应有意识地 bump 并记录，而不是被隐式漂移。
@@ -35,7 +60,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
 # 再装 playwright（提供浏览器管理），装完用 --with-deps 预置 chromium 及其系统依赖，
 # 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
-RUN npm install -g @playwright/mcp@0.0.80 @playwright/cli@0.1.19 playwright@1.63.0 \
+RUN npm config set registry "$NPM_REGISTRY" \
+    && npm install -g @playwright/mcp@0.0.80 @playwright/cli@0.1.19 playwright@1.63.0 \
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*

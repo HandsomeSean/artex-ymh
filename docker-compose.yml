@@ -20,6 +20,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.source
+      # 构建期镜像源(仅 build 生效,不影响运行时)。国内网络建议在 .env 里打开,
+      # 直接走国内镜像站可绕开代理对 deb.debian.org/registry.npmjs.org 的抖动。
+      # 注意:NPM_REGISTRY/NODE_MIRROR 不能用空默认值——空串会把 Dockerfile 里的
+      # ARG 默认值覆盖成空,导致 `npm config set registry ""` 直接构建失败。
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+        NODE_MIRROR: ${NODE_MIRROR:-https://nodejs.org/dist}
     image: artex-ymh:local
     depends_on:
       postgres:
